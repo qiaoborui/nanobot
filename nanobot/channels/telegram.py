@@ -449,9 +449,13 @@ class TelegramChannel(BaseChannel):
 
     @staticmethod
     def _derive_topic_session_key(message) -> str | None:
-        """Derive topic-scoped session key when a Telegram thread/topic id exists."""
+        """Derive topic-scoped session key only for true Telegram forum topics."""
         message_thread_id = getattr(message, "message_thread_id", None)
-        if message.chat.type == "private" or message_thread_id is None:
+        if (
+            message.chat.type == "private"
+            or not bool(getattr(message.chat, "is_forum", False))
+            or message_thread_id is None
+        ):
             return None
         return f"telegram:{message.chat_id}:topic:{message_thread_id}"
 

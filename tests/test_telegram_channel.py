@@ -148,14 +148,24 @@ async def test_start_uses_request_proxy_without_builder_proxy(monkeypatch) -> No
     assert builder.get_updates_request_value is _FakeHTTPXRequest.instances[0]
 
 
-def test_derive_topic_session_key_uses_thread_id() -> None:
+def test_derive_topic_session_key_uses_thread_id_for_forum_topics() -> None:
     message = SimpleNamespace(
-        chat=SimpleNamespace(type="supergroup"),
+        chat=SimpleNamespace(type="supergroup", is_forum=True),
         chat_id=-100123,
         message_thread_id=42,
     )
 
     assert TelegramChannel._derive_topic_session_key(message) == "telegram:-100123:topic:42"
+
+
+def test_derive_topic_session_key_ignores_non_forum_threads() -> None:
+    message = SimpleNamespace(
+        chat=SimpleNamespace(type="supergroup", is_forum=False),
+        chat_id=-100123,
+        message_thread_id=42,
+    )
+
+    assert TelegramChannel._derive_topic_session_key(message) is None
 
 
 def test_get_extension_falls_back_to_original_filename() -> None:
