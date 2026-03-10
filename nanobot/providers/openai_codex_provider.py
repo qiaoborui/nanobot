@@ -74,8 +74,9 @@ class OpenAICodexProvider(LLMProvider):
                 finish_reason=finish_reason,
             )
         except Exception as e:
+            logger.exception("Error calling Codex")
             return LLMResponse(
-                content=f"Error calling Codex: {str(e)}",
+                content=f"Error calling Codex: {type(e).__name__}: {e}",
                 finish_reason="error",
             )
 
@@ -106,13 +107,26 @@ async def _request_codex(
     headers: dict[str, str],
     body: dict[str, Any],
     verify: bool,
+    max_retries: int = 3,
 ) -> tuple[str, list[ToolCallRequest], str]:
-    async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
-        async with client.stream("POST", url, headers=headers, json=body) as response:
-            if response.status_code != 200:
-                text = await response.aread()
-                raise RuntimeError(_friendly_error(response.status_code, text.decode("utf-8", "ignore")))
-            return await _consume_sse(response)
+    last_exc: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0), verify=verify) as client:
+                async with client.stream("POST", url, headers=headers, json=body) as response:
+                    if response.status_code != 200:
+                        text = await response.aread()
+                        raise RuntimeError(_friendly_error(response.status_code, text.decode("utf-8", "ignore")))
+                    return await _consume_sse(response)
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout, httpx.ConnectError) as e:
+            last_exc = e
+            if attempt < max_retries - 1:
+                delay = 2 ** attempt
+                logger.warning(f"Codex request failed (attempt {attempt + 1}/{max_retries}): {type(e).__name__}: {e}; retrying in {delay}s")
+                await asyncio.sleep(delay)
+            else:
+                raise
+    raise last_exc  # unreachable, but keeps type checker happy
 
 
 def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:

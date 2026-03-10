@@ -5,7 +5,7 @@ import pytest
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.telegram import TelegramChannel
-from nanobot.config.schema import TelegramConfig
+from nanobot.config.schema import TelegramConfig, TelegramGroupRule
 
 
 class _FakeHTTPXRequest:
@@ -182,3 +182,84 @@ async def test_send_reply_infers_topic_from_message_id_cache() -> None:
 
     assert channel._app.bot.sent_messages[0]["message_thread_id"] == 42
     assert channel._app.bot.sent_messages[0]["reply_parameters"].message_id == 10
+
+
+def test_should_process_private_chat_even_when_group_policy_is_mention() -> None:
+    channel = TelegramChannel(TelegramConfig(group_policy="mention"), MessageBus())
+    message = SimpleNamespace(chat=SimpleNamespace(type="private"), chat_id=123)
+
+    assert channel._should_process_message(message) is True
+
+
+def test_should_process_group_message_when_mention_matches_bot_username() -> None:
+    channel = TelegramChannel(TelegramConfig(group_policy="mention"), MessageBus())
+    channel._bot_username = "nanobot_test"
+    channel._bot_user_id = 999
+    message = SimpleNamespace(
+        chat=SimpleNamespace(type="supergroup"),
+        chat_id=-1001,
+        text="hi @nanobot_test",
+        caption=None,
+        reply_to_message=None,
+        entities=[SimpleNamespace(type="mention", offset=3, length=13)],
+        caption_entities=None,
+    )
+
+    assert channel._should_process_message(message) is True
+
+
+def test_should_ignore_group_message_without_mention_by_default() -> None:
+    channel = TelegramChannel(TelegramConfig(group_policy="mention"), MessageBus())
+    channel._bot_username = "nanobot_test"
+    channel._bot_user_id = 999
+    message = SimpleNamespace(
+        chat=SimpleNamespace(type="group"),
+        chat_id=-1002,
+        text="hello everyone",
+        caption=None,
+        reply_to_message=None,
+        entities=[],
+        caption_entities=None,
+    )
+
+    assert channel._should_process_message(message) is False
+
+
+def test_should_process_group_message_when_replying_to_bot() -> None:
+    channel = TelegramChannel(TelegramConfig(group_policy="mention"), MessageBus())
+    channel._bot_username = "nanobot_test"
+    channel._bot_user_id = 999
+    message = SimpleNamespace(
+        chat=SimpleNamespace(type="supergroup"),
+        chat_id=-1003,
+        text="follow-up",
+        caption=None,
+        entities=[],
+        caption_entities=None,
+        reply_to_message=SimpleNamespace(
+            from_user=SimpleNamespace(id=999, username="nanobot_test", is_bot=True)
+        ),
+    )
+
+    assert channel._should_process_message(message) is True
+
+
+def test_per_group_override_can_open_specific_group() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(
+            group_policy="mention",
+            groups={"-1004": TelegramGroupRule(policy="open")},
+        ),
+        MessageBus(),
+    )
+    message = SimpleNamespace(
+        chat=SimpleNamespace(type="supergroup"),
+        chat_id=-1004,
+        text="plain message",
+        caption=None,
+        reply_to_message=None,
+        entities=[],
+        caption_entities=None,
+    )
+
+    assert channel._should_process_message(message) is True

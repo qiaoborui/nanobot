@@ -373,7 +373,7 @@ def gateway(
         if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
             return response
 
-        if job.payload.deliver and job.payload.to and response:
+        if job.payload.deliver and job.payload.to and response and response.strip() != "HEARTBEAT_OK":
             from nanobot.bus.events import OutboundMessage
             await bus.publish_outbound(OutboundMessage(
                 channel=job.payload.channel or "cli",

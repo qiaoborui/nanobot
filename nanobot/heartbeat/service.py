@@ -156,7 +156,7 @@ class HeartbeatService:
             logger.info("Heartbeat: tasks found, executing...")
             if self.on_execute:
                 response = await self.on_execute(tasks)
-                if response and self.on_notify:
+                if response and response.strip() != "HEARTBEAT_OK" and self.on_notify:
                     logger.info("Heartbeat: completed, delivering response")
                     await self.on_notify(response)
         except Exception:

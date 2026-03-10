@@ -8,7 +8,7 @@ import time
 import unicodedata
 
 from loguru import logger
-from telegram import BotCommand, ReplyParameters, Update
+from telegram import BotCommand, MessageEntity, ReplyParameters, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
@@ -174,6 +174,8 @@ class TelegramChannel(BaseChannel):
         self.config: TelegramConfig = config
         self.groq_api_key = groq_api_key
         self._app: Application | None = None
+        self._bot_user_id: int | None = None
+        self._bot_username: str | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
         self._media_group_buffers: dict[str, dict] = {}
@@ -242,6 +244,8 @@ class TelegramChannel(BaseChannel):
 
         # Get bot info and register command menu
         bot_info = await self._app.bot.get_me()
+        self._bot_user_id = getattr(bot_info, "id", None)
+        self._bot_username = bot_info.username.lower() if getattr(bot_info, "username", None) else None
         logger.info("Telegram bot @{} connected", bot_info.username)
 
         try:
@@ -443,9 +447,13 @@ class TelegramChannel(BaseChannel):
 
     @staticmethod
     def _derive_topic_session_key(message) -> str | None:
-        """Derive topic-scoped session key for non-private Telegram chats."""
+        """Derive topic-scoped session key only for true Telegram forum topics."""
         message_thread_id = getattr(message, "message_thread_id", None)
-        if message.chat.type == "private" or message_thread_id is None:
+        if (
+            message.chat.type == "private"
+            or not bool(getattr(message.chat, "is_forum", False))
+            or message_thread_id is None
+        ):
             return None
         return f"telegram:{message.chat_id}:topic:{message_thread_id}"
 
@@ -472,12 +480,68 @@ class TelegramChannel(BaseChannel):
         if len(self._message_threads) > 1000:
             self._message_threads.pop(next(iter(self._message_threads)))
 
+    def _effective_group_policy(self, chat_id: int) -> str:
+        """Resolve Telegram group policy with per-group override."""
+        rule = self.config.groups.get(str(chat_id))
+        return rule.policy if rule else self.config.group_policy
+
+    def _is_reply_to_bot(self, message) -> bool:
+        """Return True when the inbound message replies to a bot-authored message."""
+        reply = getattr(message, "reply_to_message", None)
+        if not reply or not getattr(reply, "from_user", None):
+            return False
+        from_user = reply.from_user
+        if self._bot_user_id is not None and getattr(from_user, "id", None) == self._bot_user_id:
+            return True
+        if self._bot_username and getattr(from_user, "username", None):
+            return from_user.username.lower() == self._bot_username
+        return bool(getattr(from_user, "is_bot", False)) and getattr(from_user, "username", None) == getattr(reply.from_user, "username", None)
+
+    def _message_mentions_bot(self, message) -> bool:
+        """Return True when Telegram entities mention this bot."""
+        if self._is_reply_to_bot(message):
+            return True
+
+        entities = list(getattr(message, "entities", None) or [])
+        if getattr(message, "caption", None):
+            entities.extend(getattr(message, "caption_entities", None) or [])
+
+        texts: list[tuple[str, list]] = []
+        if getattr(message, "text", None):
+            texts.append((message.text, getattr(message, "entities", None) or []))
+        if getattr(message, "caption", None):
+            texts.append((message.caption, getattr(message, "caption_entities", None) or []))
+
+        for source_text, source_entities in texts:
+            for entity in source_entities:
+                if entity.type == MessageEntity.TEXT_MENTION:
+                    user = getattr(entity, "user", None)
+                    if user and self._bot_user_id is not None and getattr(user, "id", None) == self._bot_user_id:
+                        return True
+                if entity.type == MessageEntity.MENTION:
+                    mention_text = source_text[entity.offset: entity.offset + entity.length]
+                    if self._bot_username and mention_text.lstrip("@").lower() == self._bot_username:
+                        return True
+        return False
+
+    def _should_process_message(self, message) -> bool:
+        """Apply Telegram group policy; private chats always pass."""
+        if message.chat.type == "private":
+            return True
+        policy = self._effective_group_policy(message.chat_id)
+        if policy == "open":
+            return True
+        return self._message_mentions_bot(message)
+
     async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward slash commands to the bus for unified handling in AgentLoop."""
         if not update.message or not update.effective_user:
             return
         message = update.message
         user = update.effective_user
+        if not self._should_process_message(message):
+            logger.debug("Ignoring Telegram command in chat {} due to group policy", message.chat_id)
+            return
         self._remember_thread_context(message)
         await self._handle_message(
             sender_id=self._sender_id(user),
@@ -497,6 +561,10 @@ class TelegramChannel(BaseChannel):
         chat_id = message.chat_id
         sender_id = self._sender_id(user)
         self._remember_thread_context(message)
+
+        if not self._should_process_message(message):
+            logger.debug("Ignoring Telegram message in chat {} due to group policy", chat_id)
+            return
 
         # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id

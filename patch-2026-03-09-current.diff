@@ -1,0 +1,308 @@
+diff --git a/nanobot/channels/telegram.py b/nanobot/channels/telegram.py
+index ecb144052e5c33db4e504a4ccb307e3b234e47a4..58064445a2255f3f4784f80947bbd3712bc61600 100644
+--- a/nanobot/channels/telegram.py
++++ b/nanobot/channels/telegram.py
+@@ -8,7 +8,7 @@ import time
+ import unicodedata
+ 
+ from loguru import logger
+-from telegram import BotCommand, ReplyParameters, Update
++from telegram import BotCommand, MessageEntity, ReplyParameters, Update
+ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+ from telegram.request import HTTPXRequest
+ 
+@@ -174,6 +174,8 @@ class TelegramChannel(BaseChannel):
+         self.config: TelegramConfig = config
+         self.groq_api_key = groq_api_key
+         self._app: Application | None = None
++        self._bot_user_id: int | None = None
++        self._bot_username: str | None = None
+         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
+         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
+         self._media_group_buffers: dict[str, dict] = {}
+@@ -242,6 +244,8 @@ class TelegramChannel(BaseChannel):
+ 
+         # Get bot info and register command menu
+         bot_info = await self._app.bot.get_me()
++        self._bot_user_id = getattr(bot_info, "id", None)
++        self._bot_username = bot_info.username.lower() if getattr(bot_info, "username", None) else None
+         logger.info("Telegram bot @{} connected", bot_info.username)
+ 
+         try:
+@@ -472,12 +476,68 @@ class TelegramChannel(BaseChannel):
+         if len(self._message_threads) > 1000:
+             self._message_threads.pop(next(iter(self._message_threads)))
+ 
++    def _effective_group_policy(self, chat_id: int) -> str:
++        """Resolve Telegram group policy with per-group override."""
++        rule = self.config.groups.get(str(chat_id))
++        return rule.policy if rule else self.config.group_policy
++
++    def _is_reply_to_bot(self, message) -> bool:
++        """Return True when the inbound message replies to a bot-authored message."""
++        reply = getattr(message, "reply_to_message", None)
++        if not reply or not getattr(reply, "from_user", None):
++            return False
++        from_user = reply.from_user
++        if self._bot_user_id is not None and getattr(from_user, "id", None) == self._bot_user_id:
++            return True
++        if self._bot_username and getattr(from_user, "username", None):
++            return from_user.username.lower() == self._bot_username
++        return bool(getattr(from_user, "is_bot", False)) and getattr(from_user, "username", None) == getattr(reply.from_user, "username", None)
++
++    def _message_mentions_bot(self, message) -> bool:
++        """Return True when Telegram entities mention this bot."""
++        if self._is_reply_to_bot(message):
++            return True
++
++        entities = list(getattr(message, "entities", None) or [])
++        if getattr(message, "caption", None):
++            entities.extend(getattr(message, "caption_entities", None) or [])
++
++        texts: list[tuple[str, list]] = []
++        if getattr(message, "text", None):
++            texts.append((message.text, getattr(message, "entities", None) or []))
++        if getattr(message, "caption", None):
++            texts.append((message.caption, getattr(message, "caption_entities", None) or []))
++
++        for source_text, source_entities in texts:
++            for entity in source_entities:
++                if entity.type == MessageEntity.TEXT_MENTION:
++                    user = getattr(entity, "user", None)
++                    if user and self._bot_user_id is not None and getattr(user, "id", None) == self._bot_user_id:
++                        return True
++                if entity.type == MessageEntity.MENTION:
++                    mention_text = source_text[entity.offset: entity.offset + entity.length]
++                    if self._bot_username and mention_text.lstrip("@").lower() == self._bot_username:
++                        return True
++        return False
++
++    def _should_process_message(self, message) -> bool:
++        """Apply Telegram group policy; private chats always pass."""
++        if message.chat.type == "private":
++            return True
++        policy = self._effective_group_policy(message.chat_id)
++        if policy == "open":
++            return True
++        return self._message_mentions_bot(message)
++
+     async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+         """Forward slash commands to the bus for unified handling in AgentLoop."""
+         if not update.message or not update.effective_user:
+             return
+         message = update.message
+         user = update.effective_user
++        if not self._should_process_message(message):
++            logger.debug("Ignoring Telegram command in chat {} due to group policy", message.chat_id)
++            return
+         self._remember_thread_context(message)
+         await self._handle_message(
+             sender_id=self._sender_id(user),
+@@ -498,6 +558,10 @@ class TelegramChannel(BaseChannel):
+         sender_id = self._sender_id(user)
+         self._remember_thread_context(message)
+ 
++        if not self._should_process_message(message):
++            logger.debug("Ignoring Telegram message in chat {} due to group policy", chat_id)
++            return
++
+         # Store chat_id for replies
+         self._chat_ids[sender_id] = chat_id
+ 
+diff --git a/nanobot/config/schema.py b/nanobot/config/schema.py
+index 803cb6139037b448130b29630c0e3346050889be..b346b216c8276be4aa604ad06fd948b694d1b0d7 100644
+--- a/nanobot/config/schema.py
++++ b/nanobot/config/schema.py
+@@ -23,6 +23,12 @@ class WhatsAppConfig(Base):
+     allow_from: list[str] = Field(default_factory=list)  # Allowed phone numbers
+ 
+ 
++class TelegramGroupRule(Base):
++    """Telegram per-group behavior override."""
++
++    policy: Literal["open", "mention"] = "mention"
++
++
+ class TelegramConfig(Base):
+     """Telegram channel configuration."""
+ 
+@@ -33,6 +39,8 @@ class TelegramConfig(Base):
+         None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
+     )
+     reply_to_message: bool = False  # If true, bot replies quote the original message
++    group_policy: Literal["open", "mention"] = "mention"
++    groups: dict[str, TelegramGroupRule] = Field(default_factory=dict)
+ 
+ 
+ class FeishuConfig(Base):
+diff --git a/nanobot/providers/openai_codex_provider.py b/nanobot/providers/openai_codex_provider.py
+index d04e21056879d2761f10f10c04bb6a32e52e3aff..c08ebfa29b7272e047f9340edf58fa66488129f8 100644
+--- a/nanobot/providers/openai_codex_provider.py
++++ b/nanobot/providers/openai_codex_provider.py
+@@ -74,8 +74,9 @@ class OpenAICodexProvider(LLMProvider):
+                 finish_reason=finish_reason,
+             )
+         except Exception as e:
++            logger.exception("Error calling Codex")
+             return LLMResponse(
+-                content=f"Error calling Codex: {str(e)}",
++                content=f"Error calling Codex: {type(e).__name__}: {e}",
+                 finish_reason="error",
+             )
+ 
+@@ -106,13 +107,26 @@ async def _request_codex(
+     headers: dict[str, str],
+     body: dict[str, Any],
+     verify: bool,
++    max_retries: int = 3,
+ ) -> tuple[str, list[ToolCallRequest], str]:
+-    async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
+-        async with client.stream("POST", url, headers=headers, json=body) as response:
+-            if response.status_code != 200:
+-                text = await response.aread()
+-                raise RuntimeError(_friendly_error(response.status_code, text.decode("utf-8", "ignore")))
+-            return await _consume_sse(response)
++    last_exc: Exception | None = None
++    for attempt in range(max_retries):
++        try:
++            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0), verify=verify) as client:
++                async with client.stream("POST", url, headers=headers, json=body) as response:
++                    if response.status_code != 200:
++                        text = await response.aread()
++                        raise RuntimeError(_friendly_error(response.status_code, text.decode("utf-8", "ignore")))
++                    return await _consume_sse(response)
++        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout, httpx.ConnectError) as e:
++            last_exc = e
++            if attempt < max_retries - 1:
++                delay = 2 ** attempt
++                logger.warning(f"Codex request failed (attempt {attempt + 1}/{max_retries}): {type(e).__name__}: {e}; retrying in {delay}s")
++                await asyncio.sleep(delay)
++            else:
++                raise
++    raise last_exc  # unreachable, but keeps type checker happy
+ 
+ 
+ def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+diff --git a/tests/test_telegram_channel.py b/tests/test_telegram_channel.py
+index 88c3f54cca7b064b5ad6002c554e6699e6dfa3dc..9d2bd5b54a3048c65f452d8602855e4c22f0f5ef 100644
+--- a/tests/test_telegram_channel.py
++++ b/tests/test_telegram_channel.py
+@@ -5,7 +5,7 @@ import pytest
+ from nanobot.bus.events import OutboundMessage
+ from nanobot.bus.queue import MessageBus
+ from nanobot.channels.telegram import TelegramChannel
+-from nanobot.config.schema import TelegramConfig
++from nanobot.config.schema import TelegramConfig, TelegramGroupRule
+ 
+ 
+ class _FakeHTTPXRequest:
+@@ -182,3 +182,84 @@ async def test_send_reply_infers_topic_from_message_id_cache() -> None:
+ 
+     assert channel._app.bot.sent_messages[0]["message_thread_id"] == 42
+     assert channel._app.bot.sent_messages[0]["reply_parameters"].message_id == 10
++
++
++def test_should_process_private_chat_message() -> None:
++    config = TelegramConfig(bot_token="token")
++    channel = TelegramChannel(config, MessageBus())
++
++    class _Chat:
++        type = "private"
++
++    class _Message:
++        chat = _Chat()
++        chat_id = 1
++        text = "hello"
++        entities = []
++        caption = None
++        caption_entities = []
++        reply_to_message = None
++
++    assert channel._should_process_message(_Message()) is True
++
++
++def test_should_process_group_message_when_policy_open() -> None:
++    config = TelegramConfig(bot_token="token", group_policy="open")
++    channel = TelegramChannel(config, MessageBus())
++
++    class _Chat:
++        type = "group"
++
++    class _Message:
++        chat = _Chat()
++        chat_id = -100
++        text = "hello everyone"
++        entities = []
++        caption = None
++        caption_entities = []
++        reply_to_message = None
++
++    assert channel._should_process_message(_Message()) is True
++
++
++def test_should_process_group_message_when_mentioned() -> None:
++    config = TelegramConfig(bot_token="token", group_policy="mention")
++    channel = TelegramChannel(config, MessageBus())
++    channel._bot_username = "homepiclawbot"
++
++    class _Entity:
++        type = "mention"
++        offset = 0
++        length = 15
++
++    class _Chat:
++        type = "supergroup"
++
++    class _Message:
++        chat = _Chat()
++        chat_id = -100
++        text = "@homepiclawbot hi"
++        entities = [_Entity()]
++        caption = None
++        caption_entities = []
++        reply_to_message = None
++
++    assert channel._should_process_message(_Message()) is True
++
++
++def test_should_ignore_group_message_without_mention_under_mention_policy() -> None:
++    config = TelegramConfig(bot_token="token", group_policy="mention")
++    channel = TelegramChannel(config, MessageBus())
++    channel._bot_username = "homepiclawbot"
++
++    class _Chat:
++        type = "group"
++
++    class _Message:
++        chat = _Chat()
++        chat_id = -100
++        text = "hello everyone"
++        entities = []
++        caption = None
++        caption_entities = []
++        reply_to_message = None
++
++    assert channel._should_process_message(_Message()) is False
++
++
++def test_group_override_applies_specific_chat_policy() -> None:
++    config = TelegramConfig(
++        bot_token="token",
++        group_policy="mention",
++        groups={"-100": TelegramGroupRule(policy="open")},
++    )
++    channel = TelegramChannel(config, MessageBus())
++
++    class _Chat:
++        type = "supergroup"
++
++    class _Message:
++        chat = _Chat()
++        chat_id = -100
++        text = "hello without mention"
++        entities = []
++        caption = None
++        caption_entities = []
++        reply_to_message = None
++
++    assert channel._should_process_message(_Message()) is True

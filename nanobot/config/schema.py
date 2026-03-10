@@ -23,6 +23,12 @@ class WhatsAppConfig(Base):
     allow_from: list[str] = Field(default_factory=list)  # Allowed phone numbers
 
 
+class TelegramGroupRule(Base):
+    """Telegram per-group behavior override."""
+
+    policy: Literal["open", "mention"] = "mention"
+
+
 class TelegramConfig(Base):
     """Telegram channel configuration."""
 
@@ -33,6 +39,8 @@ class TelegramConfig(Base):
         None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
     )
     reply_to_message: bool = False  # If true, bot replies quote the original message
+    group_policy: Literal["open", "mention"] = "mention"
+    groups: dict[str, TelegramGroupRule] = Field(default_factory=dict)
 
 
 class FeishuConfig(Base):
